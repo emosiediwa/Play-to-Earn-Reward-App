@@ -8,12 +8,15 @@
 (define-constant err-task-completed (err u106))
 (define-constant err-invalid-task (err u107))
 (define-constant err-cooldown-active (err u108))
+(define-constant err-achievement-exists (err u109))
+(define-constant err-invalid-achievement (err u110))
 
 (define-data-var game-paused bool false)
 (define-data-var total-players uint u0)
 (define-data-var reward-rate uint u10)
 (define-data-var daily-reward uint u100)
 (define-data-var task-cooldown uint u86400)
+(define-data-var total-achievements uint u0)
 
 (define-map players principal {
     points: uint,
@@ -41,6 +44,21 @@
 
 (define-map admin-list principal bool)
 
+(define-map achievements uint {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    points-requirement: uint,
+    tasks-requirement: uint,
+    special-condition: uint,
+    bonus-points: uint,
+    is-active: bool
+})
+
+(define-map player-achievements {player: principal, achievement-id: uint} {
+    earned: bool,
+    earned-at: uint
+})
+
 (define-private (is-owner (caller principal))
     (is-eq caller contract-owner)
 )
@@ -56,6 +74,43 @@
 (define-private (get-current-time)
     stacks-block-height
 )
+
+(define-private (check-achievements (player principal))
+    (let ((player-data (unwrap! (map-get? players player) false)))
+        (begin
+            (check-single-achievement player u1 (get total-earned player-data) (get tasks-completed player-data))
+            (check-single-achievement player u2 (get total-earned player-data) (get tasks-completed player-data))
+            (check-single-achievement player u3 (get total-earned player-data) (get tasks-completed player-data))
+            true)))
+
+(define-private (check-single-achievement (player principal) (achievement-id uint) (total-earned uint) (tasks-completed uint))
+    (match (map-get? achievements achievement-id)
+        achievement-data 
+            (let ((already-earned (match (map-get? player-achievements {player: player, achievement-id: achievement-id})
+                                         some-achievement (get earned some-achievement)
+                                         false)))
+                (if (and 
+                        (get is-active achievement-data)
+                        (>= total-earned (get points-requirement achievement-data))
+                        (>= tasks-completed (get tasks-requirement achievement-data))
+                        (not already-earned))
+                    (begin
+                        (map-set player-achievements {player: player, achievement-id: achievement-id} {
+                            earned: true,
+                            earned-at: (get-current-time)
+                        })
+                        (let ((player-data (unwrap! (map-get? players player) false)))
+                            (map-set players player {
+                                points: (+ (get points player-data) (get bonus-points achievement-data)),
+                                total-earned: (+ (get total-earned player-data) (get bonus-points achievement-data)),
+                                tasks-completed: (get tasks-completed player-data),
+                                last-daily-claim: (get last-daily-claim player-data),
+                                registration-block: (get registration-block player-data),
+                                is-active: (get is-active player-data)
+                            }))
+                        true)
+                    false))
+        false))
 
 (define-private (update-leaderboard (player principal))
     (let ((player-data (unwrap! (map-get? players player) false)))
@@ -116,6 +171,7 @@
                                 is-active: (get is-active player-data)
                             })
                             (update-leaderboard caller)
+                            (check-achievements caller)
                             (ok reward-points))))))))
 
 (define-public (claim-daily-reward)
@@ -133,6 +189,7 @@
                     is-active: (get is-active player-data)
                 })
                 (update-leaderboard caller)
+                (check-achievements caller)
                 (ok daily-points)))))
 
 (define-public (spend-points (amount uint))
@@ -239,6 +296,63 @@
         (map-delete admin-list admin)
         (ok true)))
 
+(define-public (create-achievement (achievement-id uint) (name (string-ascii 50)) (description (string-ascii 100)) 
+                                  (points-requirement uint) (tasks-requirement uint) (special-condition uint) (bonus-points uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (asserts! (is-none (map-get? achievements achievement-id)) err-achievement-exists)
+        (map-set achievements achievement-id {
+            name: name,
+            description: description,
+            points-requirement: points-requirement,
+            tasks-requirement: tasks-requirement,
+            special-condition: special-condition,
+            bonus-points: bonus-points,
+            is-active: true
+        })
+        (var-set total-achievements (+ (var-get total-achievements) u1))
+        (ok true)))
+
+(define-public (toggle-achievement (achievement-id uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (let ((achievement-data (unwrap! (map-get? achievements achievement-id) err-invalid-achievement)))
+            (map-set achievements achievement-id {
+                name: (get name achievement-data),
+                description: (get description achievement-data),
+                points-requirement: (get points-requirement achievement-data),
+                tasks-requirement: (get tasks-requirement achievement-data),
+                special-condition: (get special-condition achievement-data),
+                bonus-points: (get bonus-points achievement-data),
+                is-active: (not (get is-active achievement-data))
+            })
+            (ok (not (get is-active achievement-data))))))
+
+(define-public (award-achievement (player principal) (achievement-id uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (asserts! (is-some (map-get? players player)) err-not-found)
+        (let ((achievement-data (unwrap! (map-get? achievements achievement-id) err-invalid-achievement)))
+            (asserts! (get is-active achievement-data) err-invalid-achievement)
+            (let ((already-earned (match (map-get? player-achievements {player: player, achievement-id: achievement-id})
+                                         some-achievement (get earned some-achievement)
+                                         false)))
+                (asserts! (not already-earned) err-achievement-exists))
+            (map-set player-achievements {player: player, achievement-id: achievement-id} {
+                earned: true,
+                earned-at: (get-current-time)
+            })
+            (let ((player-data (unwrap! (map-get? players player) err-not-found)))
+                (map-set players player {
+                    points: (+ (get points player-data) (get bonus-points achievement-data)),
+                    total-earned: (+ (get total-earned player-data) (get bonus-points achievement-data)),
+                    tasks-completed: (get tasks-completed player-data),
+                    last-daily-claim: (get last-daily-claim player-data),
+                    registration-block: (get registration-block player-data),
+                    is-active: (get is-active player-data)
+                }))
+            (ok true))))
+
 (define-read-only (get-player-data (player principal))
     (map-get? players player))
 
@@ -251,13 +365,27 @@
 (define-read-only (get-leaderboard-entry (rank uint))
     (map-get? leaderboard rank))
 
+(define-read-only (get-achievement-data (achievement-id uint))
+    (map-get? achievements achievement-id))
+
+(define-read-only (get-player-achievement (player principal) (achievement-id uint))
+    (map-get? player-achievements {player: player, achievement-id: achievement-id}))
+
+(define-read-only (get-player-achievements-list (player principal))
+    (list 
+        (map-get? player-achievements {player: player, achievement-id: u1})
+        (map-get? player-achievements {player: player, achievement-id: u2})
+        (map-get? player-achievements {player: player, achievement-id: u3})
+    ))
+
 (define-read-only (get-game-stats)
     {
         total-players: (var-get total-players),
         game-paused: (var-get game-paused),
         reward-rate: (var-get reward-rate),
         daily-reward: (var-get daily-reward),
-        leaderboard-size: (var-get leaderboard-size)
+        leaderboard-size: (var-get leaderboard-size),
+        total-achievements: (var-get total-achievements)
     })
 
 (define-read-only (is-player-registered (player principal))
