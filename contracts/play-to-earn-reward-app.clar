@@ -10,6 +10,8 @@
 (define-constant err-cooldown-active (err u108))
 (define-constant err-achievement-exists (err u109))
 (define-constant err-invalid-achievement (err u110))
+(define-constant err-invalid-referral (err u111))
+(define-constant err-referral-exists (err u112))
 
 (define-data-var game-paused bool false)
 (define-data-var total-players uint u0)
@@ -17,6 +19,8 @@
 (define-data-var daily-reward uint u100)
 (define-data-var task-cooldown uint u86400)
 (define-data-var total-achievements uint u0)
+(define-data-var referral-rate uint u10)
+(define-data-var total-referrals uint u0)
 
 (define-map players principal {
     points: uint,
@@ -59,21 +63,69 @@
     earned-at: uint
 })
 
+(define-map referral-codes (string-ascii 8) principal)
+
+(define-map player-referrals principal {
+    referrer: (optional principal),
+    referees-count: uint,
+    total-referral-earned: uint,
+    referral-code: (string-ascii 8)
+})
+
 (define-private (is-owner (caller principal))
-    (is-eq caller contract-owner)
-)
+    (is-eq caller contract-owner))
 
 (define-private (is-admin (caller principal))
-    (default-to false (map-get? admin-list caller))
-)
+    (default-to false (map-get? admin-list caller)))
 
 (define-private (is-game-active)
-    (not (var-get game-paused))
-)
+    (not (var-get game-paused)))
 
 (define-private (get-current-time)
-    stacks-block-height
-)
+    stacks-block-height)
+
+(define-private (generate-referral-code (seed uint))
+    (let ((code-index (mod seed u10)))
+        (if (is-eq code-index u0) "ABCD1234"
+            (if (is-eq code-index u1) "EFGH5678"
+                (if (is-eq code-index u2) "IJKL9012"
+                    (if (is-eq code-index u3) "MNOP3456"
+                        (if (is-eq code-index u4) "QRST7890"
+                            (if (is-eq code-index u5) "UVWX1357"
+                                (if (is-eq code-index u6) "YZAB2468"
+                                    (if (is-eq code-index u7) "CDEF9753"
+                                        (if (is-eq code-index u8) "GHIJ8642"
+                                            "KLMN0987")))))))))))
+
+(define-private (process-referral-reward (referee principal) (points-earned uint))
+    (match (map-get? player-referrals referee)
+        referee-data
+            (match (get referrer referee-data)
+                referrer-principal
+                    (let ((referral-reward (/ (* points-earned (var-get referral-rate)) u100)))
+                        (if (> referral-reward u0)
+                            (begin
+                                (let ((referrer-data (unwrap! (map-get? players referrer-principal) false)))
+                                    (map-set players referrer-principal {
+                                        points: (+ (get points referrer-data) referral-reward),
+                                        total-earned: (+ (get total-earned referrer-data) referral-reward),
+                                        tasks-completed: (get tasks-completed referrer-data),
+                                        last-daily-claim: (get last-daily-claim referrer-data),
+                                        registration-block: (get registration-block referrer-data),
+                                        is-active: (get is-active referrer-data)
+                                    }))
+                                (let ((current-referrer-data (default-to {referrer: none, referees-count: u0, total-referral-earned: u0, referral-code: "NONE0000"} 
+                                                                         (map-get? player-referrals referrer-principal))))
+                                    (map-set player-referrals referrer-principal {
+                                        referrer: (get referrer current-referrer-data),
+                                        referees-count: (get referees-count current-referrer-data),
+                                        total-referral-earned: (+ (get total-referral-earned current-referrer-data) referral-reward),
+                                        referral-code: (get referral-code current-referrer-data)
+                                    }))
+                                true)
+                            false))
+                false)
+        false))
 
 (define-private (check-achievements (player principal))
     (let ((player-data (unwrap! (map-get? players player) false)))
@@ -133,16 +185,58 @@
     (let ((caller tx-sender))
         (asserts! (is-game-active) err-game-paused)
         (asserts! (is-none (map-get? players caller)) err-already-exists)
-        (map-set players caller {
-            points: u0,
-            total-earned: u0,
-            tasks-completed: u0,
-            last-daily-claim: u0,
-            registration-block: (get-current-time),
-            is-active: true
-        })
-        (var-set total-players (+ (var-get total-players) u1))
-        (ok true)))
+        (let ((ref-code (generate-referral-code (get-current-time))))
+            (map-set players caller {
+                points: u0,
+                total-earned: u0,
+                tasks-completed: u0,
+                last-daily-claim: u0,
+                registration-block: (get-current-time),
+                is-active: true
+            })
+            (map-set referral-codes ref-code caller)
+            (map-set player-referrals caller {
+                referrer: none,
+                referees-count: u0,
+                total-referral-earned: u0,
+                referral-code: ref-code
+            })
+            (var-set total-players (+ (var-get total-players) u1))
+            (ok ref-code))))
+
+(define-public (register-with-referral (referral-code (string-ascii 8)))
+    (let ((caller tx-sender))
+        (asserts! (is-game-active) err-game-paused)
+        (asserts! (is-none (map-get? players caller)) err-already-exists)
+        (let ((referrer (unwrap! (map-get? referral-codes referral-code) err-invalid-referral)))
+            (asserts! (not (is-eq caller referrer)) err-invalid-referral)
+            (let ((ref-code (generate-referral-code (get-current-time))))
+                (map-set players caller {
+                    points: u0,
+                    total-earned: u0,
+                    tasks-completed: u0,
+                    last-daily-claim: u0,
+                    registration-block: (get-current-time),
+                    is-active: true
+                })
+                (map-set referral-codes ref-code caller)
+                (map-set player-referrals caller {
+                    referrer: (some referrer),
+                    referees-count: u0,
+                    total-referral-earned: u0,
+                    referral-code: ref-code
+                })
+                (let ((referrer-data (default-to {referrer: none, referees-count: u0, total-referral-earned: u0, referral-code: "NONE0000"} 
+                                                  (map-get? player-referrals referrer))))
+                    (map-set player-referrals referrer {
+                        referrer: (get referrer referrer-data),
+                        referees-count: (+ (get referees-count referrer-data) u1),
+                        total-referral-earned: (get total-referral-earned referrer-data),
+                        referral-code: (get referral-code referrer-data)
+                    }))
+                (var-set total-players (+ (var-get total-players) u1))
+                (var-set total-referrals (+ (var-get total-referrals) u1))
+                (ok ref-code)))))
 
 (define-public (complete-task (task-id uint))
     (let ((caller tx-sender))
@@ -172,6 +266,7 @@
                             })
                             (update-leaderboard caller)
                             (check-achievements caller)
+                            (process-referral-reward caller reward-points)
                             (ok reward-points))))))))
 
 (define-public (claim-daily-reward)
@@ -190,6 +285,7 @@
                 })
                 (update-leaderboard caller)
                 (check-achievements caller)
+                (process-referral-reward caller daily-points)
                 (ok daily-points)))))
 
 (define-public (spend-points (amount uint))
@@ -283,6 +379,13 @@
         (asserts! (is-owner caller) err-owner-only)
         (var-set daily-reward new-reward)
         (ok new-reward)))
+
+(define-public (set-referral-rate (new-rate uint))
+    (let ((caller tx-sender))
+        (asserts! (is-owner caller) err-owner-only)
+        (asserts! (<= new-rate u100) err-invalid-amount)
+        (var-set referral-rate new-rate)
+        (ok new-rate)))
 
 (define-public (add-admin (admin principal))
     (let ((caller tx-sender))
@@ -378,6 +481,12 @@
         (map-get? player-achievements {player: player, achievement-id: u3})
     ))
 
+(define-read-only (get-referral-data (player principal))
+    (map-get? player-referrals player))
+
+(define-read-only (get-referrer-by-code (referral-code (string-ascii 8)))
+    (map-get? referral-codes referral-code))
+
 (define-read-only (get-game-stats)
     {
         total-players: (var-get total-players),
@@ -385,7 +494,9 @@
         reward-rate: (var-get reward-rate),
         daily-reward: (var-get daily-reward),
         leaderboard-size: (var-get leaderboard-size),
-        total-achievements: (var-get total-achievements)
+        total-achievements: (var-get total-achievements),
+        referral-rate: (var-get referral-rate),
+        total-referrals: (var-get total-referrals)
     })
 
 (define-read-only (is-player-registered (player principal))
