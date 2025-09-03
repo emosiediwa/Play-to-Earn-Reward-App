@@ -12,6 +12,9 @@
 (define-constant err-invalid-achievement (err u110))
 (define-constant err-invalid-referral (err u111))
 (define-constant err-referral-exists (err u112))
+(define-constant err-invalid-stake (err u113))
+(define-constant err-stake-locked (err u114))
+(define-constant err-invalid-pool (err u115))
 
 (define-data-var game-paused bool false)
 (define-data-var total-players uint u0)
@@ -21,6 +24,8 @@
 (define-data-var total-achievements uint u0)
 (define-data-var referral-rate uint u10)
 (define-data-var total-referrals uint u0)
+(define-data-var total-staked uint u0)
+(define-data-var total-stakes uint u0)
 
 (define-map players principal {
     points: uint,
@@ -72,6 +77,25 @@
     referral-code: (string-ascii 8)
 })
 
+(define-map staking-pools uint {
+    name: (string-ascii 30),
+    apr-rate: uint,
+    lock-duration: uint,
+    min-stake: uint,
+    is-active: bool,
+    penalty-rate: uint
+})
+
+(define-map player-stakes {player: principal, stake-id: uint} {
+    pool-id: uint,
+    amount: uint,
+    start-time: uint,
+    claimed-rewards: uint,
+    is-active: bool
+})
+
+(define-map stake-counters principal uint)
+
 (define-private (is-owner (caller principal))
     (is-eq caller contract-owner))
 
@@ -96,6 +120,17 @@
                                     (if (is-eq code-index u7) "CDEF9753"
                                         (if (is-eq code-index u8) "GHIJ8642"
                                             "KLMN0987")))))))))))
+
+(define-private (calculate-staking-rewards (pool-id uint) (amount uint) (duration-blocks uint))
+    (match (map-get? staking-pools pool-id)
+        pool-data
+            (let ((apr (get apr-rate pool-data)))
+                (let ((blocks-per-year u52560))
+                    (/ (* amount apr duration-blocks) (* blocks-per-year u100))))
+        u0))
+
+(define-private (get-next-stake-id (player principal))
+    (+ (default-to u0 (map-get? stake-counters player)) u1))
 
 (define-private (process-referral-reward (referee principal) (points-earned uint))
     (match (map-get? player-referrals referee)
@@ -431,6 +466,132 @@
             })
             (ok (not (get is-active achievement-data))))))
 
+(define-public (create-staking-pool (pool-id uint) (name (string-ascii 30)) (apr-rate uint) (lock-duration uint) (min-stake uint) (penalty-rate uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (asserts! (is-none (map-get? staking-pools pool-id)) err-already-exists)
+        (asserts! (<= apr-rate u200) err-invalid-amount)
+        (asserts! (<= penalty-rate u50) err-invalid-amount)
+        (map-set staking-pools pool-id {
+            name: name,
+            apr-rate: apr-rate,
+            lock-duration: lock-duration,
+            min-stake: min-stake,
+            is-active: true,
+            penalty-rate: penalty-rate
+        })
+        (ok true)))
+
+(define-public (toggle-staking-pool (pool-id uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (let ((pool-data (unwrap! (map-get? staking-pools pool-id) err-invalid-pool)))
+            (map-set staking-pools pool-id {
+                name: (get name pool-data),
+                apr-rate: (get apr-rate pool-data),
+                lock-duration: (get lock-duration pool-data),
+                min-stake: (get min-stake pool-data),
+                is-active: (not (get is-active pool-data)),
+                penalty-rate: (get penalty-rate pool-data)
+            })
+            (ok (not (get is-active pool-data))))))
+
+(define-public (stake-points (pool-id uint) (amount uint))
+    (let ((caller tx-sender))
+        (asserts! (is-game-active) err-game-paused)
+        (asserts! (> amount u0) err-invalid-amount)
+        (let ((player-data (unwrap! (map-get? players caller) err-not-found)))
+            (let ((pool-data (unwrap! (map-get? staking-pools pool-id) err-invalid-pool)))
+                (asserts! (get is-active pool-data) err-invalid-pool)
+                (asserts! (>= amount (get min-stake pool-data)) err-invalid-amount)
+                (asserts! (>= (get points player-data) amount) err-insufficient-balance)
+                (let ((stake-id (get-next-stake-id caller)))
+                    (map-set players caller {
+                        points: (- (get points player-data) amount),
+                        total-earned: (get total-earned player-data),
+                        tasks-completed: (get tasks-completed player-data),
+                        last-daily-claim: (get last-daily-claim player-data),
+                        registration-block: (get registration-block player-data),
+                        is-active: (get is-active player-data)
+                    })
+                    (map-set player-stakes {player: caller, stake-id: stake-id} {
+                        pool-id: pool-id,
+                        amount: amount,
+                        start-time: (get-current-time),
+                        claimed-rewards: u0,
+                        is-active: true
+                    })
+                    (map-set stake-counters caller stake-id)
+                    (var-set total-staked (+ (var-get total-staked) amount))
+                    (var-set total-stakes (+ (var-get total-stakes) u1))
+                    (ok stake-id))))))
+
+(define-public (claim-staking-rewards (stake-id uint))
+    (let ((caller tx-sender))
+        (asserts! (is-game-active) err-game-paused)
+        (let ((stake-key {player: caller, stake-id: stake-id}))
+            (let ((stake-data (unwrap! (map-get? player-stakes stake-key) err-invalid-stake)))
+                (asserts! (get is-active stake-data) err-invalid-stake)
+                (let ((pool-data (unwrap! (map-get? staking-pools (get pool-id stake-data)) err-invalid-pool)))
+                    (let ((duration (- (get-current-time) (get start-time stake-data))))
+                        (let ((total-rewards (calculate-staking-rewards (get pool-id stake-data) (get amount stake-data) duration)))
+                            (let ((claimable-rewards (- total-rewards (get claimed-rewards stake-data))))
+                                (if (> claimable-rewards u0)
+                                    (begin
+                                        (let ((player-data (unwrap! (map-get? players caller) err-not-found)))
+                                            (map-set players caller {
+                                                points: (+ (get points player-data) claimable-rewards),
+                                                total-earned: (+ (get total-earned player-data) claimable-rewards),
+                                                tasks-completed: (get tasks-completed player-data),
+                                                last-daily-claim: (get last-daily-claim player-data),
+                                                registration-block: (get registration-block player-data),
+                                                is-active: (get is-active player-data)
+                                            }))
+                                        (map-set player-stakes stake-key {
+                                            pool-id: (get pool-id stake-data),
+                                            amount: (get amount stake-data),
+                                            start-time: (get start-time stake-data),
+                                            claimed-rewards: total-rewards,
+                                            is-active: (get is-active stake-data)
+                                        })
+                                        (ok claimable-rewards))
+                                    (ok u0))))))))))
+
+(define-public (unstake-points (stake-id uint))
+    (let ((caller tx-sender))
+        (asserts! (is-game-active) err-game-paused)
+        (let ((stake-key {player: caller, stake-id: stake-id}))
+            (let ((stake-data (unwrap! (map-get? player-stakes stake-key) err-invalid-stake)))
+                (asserts! (get is-active stake-data) err-invalid-stake)
+                (let ((pool-data (unwrap! (map-get? staking-pools (get pool-id stake-data)) err-invalid-pool)))
+                    (let ((duration (- (get-current-time) (get start-time stake-data))))
+                        (let ((lock-duration (get lock-duration pool-data)))
+                            (let ((penalty-rate (get penalty-rate pool-data)))
+                                (let ((is-early-withdraw (< duration lock-duration)))
+                                    (let ((penalty (if is-early-withdraw (/ (* (get amount stake-data) penalty-rate) u100) u0)))
+                                        (let ((return-amount (- (get amount stake-data) penalty)))
+                                            (let ((total-rewards (calculate-staking-rewards (get pool-id stake-data) (get amount stake-data) duration)))
+                                                (let ((unclaimed-rewards (- total-rewards (get claimed-rewards stake-data))))
+                                                    (let ((final-return (+ return-amount unclaimed-rewards)))
+                                                        (let ((player-data (unwrap! (map-get? players caller) err-not-found)))
+                                                            (map-set players caller {
+                                                                points: (+ (get points player-data) final-return),
+                                                                total-earned: (+ (get total-earned player-data) unclaimed-rewards),
+                                                                tasks-completed: (get tasks-completed player-data),
+                                                                last-daily-claim: (get last-daily-claim player-data),
+                                                                registration-block: (get registration-block player-data),
+                                                                is-active: (get is-active player-data)
+                                                            }))
+                                                        (map-set player-stakes stake-key {
+                                                            pool-id: (get pool-id stake-data),
+                                                            amount: (get amount stake-data),
+                                                            start-time: (get start-time stake-data),
+                                                            claimed-rewards: (get claimed-rewards stake-data),
+                                                            is-active: false
+                                                        })
+                                                        (var-set total-staked (- (var-get total-staked) (get amount stake-data)))
+                                                        (ok final-return)))))))))))))))
+
 (define-public (award-achievement (player principal) (achievement-id uint))
     (let ((caller tx-sender))
         (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
@@ -487,6 +648,22 @@
 (define-read-only (get-referrer-by-code (referral-code (string-ascii 8)))
     (map-get? referral-codes referral-code))
 
+(define-read-only (get-staking-pool (pool-id uint))
+    (map-get? staking-pools pool-id))
+
+(define-read-only (get-player-stake (player principal) (stake-id uint))
+    (map-get? player-stakes {player: player, stake-id: stake-id}))
+
+(define-read-only (get-stake-rewards (player principal) (stake-id uint))
+    (match (map-get? player-stakes {player: player, stake-id: stake-id})
+        stake-data
+            (if (get is-active stake-data)
+                (let ((duration (- (get-current-time) (get start-time stake-data))))
+                    (let ((total-rewards (calculate-staking-rewards (get pool-id stake-data) (get amount stake-data) duration)))
+                        (some (- total-rewards (get claimed-rewards stake-data)))))
+                none)
+        none))
+
 (define-read-only (get-game-stats)
     {
         total-players: (var-get total-players),
@@ -496,7 +673,9 @@
         leaderboard-size: (var-get leaderboard-size),
         total-achievements: (var-get total-achievements),
         referral-rate: (var-get referral-rate),
-        total-referrals: (var-get total-referrals)
+        total-referrals: (var-get total-referrals),
+        total-staked: (var-get total-staked),
+        total-stakes: (var-get total-stakes)
     })
 
 (define-read-only (is-player-registered (player principal))
