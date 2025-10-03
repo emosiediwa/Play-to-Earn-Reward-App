@@ -15,6 +15,9 @@
 (define-constant err-invalid-stake (err u113))
 (define-constant err-stake-locked (err u114))
 (define-constant err-invalid-pool (err u115))
+(define-constant err-lottery-closed (err u116))
+(define-constant err-lottery-active (err u117))
+(define-constant err-no-winner (err u118))
 
 (define-data-var game-paused bool false)
 (define-data-var total-players uint u0)
@@ -26,6 +29,8 @@
 (define-data-var total-referrals uint u0)
 (define-data-var total-staked uint u0)
 (define-data-var total-stakes uint u0)
+(define-data-var current-lottery-round uint u0)
+(define-data-var lottery-ticket-price uint u50)
 
 (define-map players principal {
     points: uint,
@@ -96,6 +101,20 @@
 
 (define-map stake-counters principal uint)
 
+(define-map lottery-rounds uint {
+    is-active: bool,
+    prize-pool: uint,
+    ticket-price: uint,
+    end-block: uint,
+    total-tickets: uint,
+    winner: (optional principal),
+    draw-block: uint
+})
+
+(define-map lottery-tickets {round-id: uint, ticket-id: uint} principal)
+
+(define-map player-lottery-tickets {player: principal, round-id: uint} uint)
+
 (define-private (is-owner (caller principal))
     (is-eq caller contract-owner))
 
@@ -131,6 +150,12 @@
 
 (define-private (get-next-stake-id (player principal))
     (+ (default-to u0 (map-get? stake-counters player)) u1))
+
+(define-private (generate-random-winner (round-id uint) (total-tickets uint))
+    (let ((round-data (unwrap! (map-get? lottery-rounds round-id) u0)))
+        (let ((draw-block (get draw-block round-data)))
+            (let ((random-seed (+ draw-block round-id)))
+                (mod random-seed total-tickets)))))
 
 (define-private (process-referral-reward (referee principal) (points-earned uint))
     (match (map-get? player-referrals referee)
@@ -592,6 +617,122 @@
                                                         (var-set total-staked (- (var-get total-staked) (get amount stake-data)))
                                                         (ok final-return)))))))))))))))
 
+(define-public (create-lottery-round (duration-blocks uint) (ticket-price uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (let ((current-round (var-get current-lottery-round)))
+            (match (map-get? lottery-rounds current-round)
+                existing-round (asserts! (not (get is-active existing-round)) err-lottery-active)
+                true)
+            (let ((new-round-id (+ current-round u1)))
+                (map-set lottery-rounds new-round-id {
+                    is-active: true,
+                    prize-pool: u0,
+                    ticket-price: ticket-price,
+                    end-block: (+ (get-current-time) duration-blocks),
+                    total-tickets: u0,
+                    winner: none,
+                    draw-block: u0
+                })
+                (var-set current-lottery-round new-round-id)
+                (var-set lottery-ticket-price ticket-price)
+                (ok new-round-id)))))
+
+(define-public (buy-lottery-ticket (round-id uint) (num-tickets uint))
+    (let ((caller tx-sender))
+        (asserts! (is-game-active) err-game-paused)
+        (asserts! (> num-tickets u0) err-invalid-amount)
+        (let ((round-data (unwrap! (map-get? lottery-rounds round-id) err-not-found)))
+            (asserts! (get is-active round-data) err-lottery-closed)
+            (asserts! (<= (get-current-time) (get end-block round-data)) err-lottery-closed)
+            (let ((total-cost (* (get ticket-price round-data) num-tickets)))
+                (let ((player-data (unwrap! (map-get? players caller) err-not-found)))
+                    (asserts! (>= (get points player-data) total-cost) err-insufficient-balance)
+                    (map-set players caller {
+                        points: (- (get points player-data) total-cost),
+                        total-earned: (get total-earned player-data),
+                        tasks-completed: (get tasks-completed player-data),
+                        last-daily-claim: (get last-daily-claim player-data),
+                        registration-block: (get registration-block player-data),
+                        is-active: (get is-active player-data)
+                    })
+                    (let ((current-total (get total-tickets round-data)))
+                        (let ((new-total (+ current-total num-tickets)))
+                            (let ((player-ticket-count (default-to u0 (map-get? player-lottery-tickets {player: caller, round-id: round-id}))))
+                                (map-set player-lottery-tickets {player: caller, round-id: round-id} (+ player-ticket-count num-tickets))
+                                (map-set lottery-rounds round-id {
+                                    is-active: (get is-active round-data),
+                                    prize-pool: (+ (get prize-pool round-data) total-cost),
+                                    ticket-price: (get ticket-price round-data),
+                                    end-block: (get end-block round-data),
+                                    total-tickets: new-total,
+                                    winner: (get winner round-data),
+                                    draw-block: (get draw-block round-data)
+                                })
+                                (let ((start-ticket current-total))
+                                    (fold assign-ticket-to-player 
+                                        (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9) 
+                                        {player: caller, round: round-id, start: start-ticket, count: num-tickets})
+                                    (ok new-total))))))))))
+
+(define-private (assign-ticket-to-player (index uint) (context {player: principal, round: uint, start: uint, count: uint}))
+    (if (< index (get count context))
+        (begin
+            (map-set lottery-tickets 
+                {round-id: (get round context), ticket-id: (+ (get start context) index)} 
+                (get player context))
+            context)
+        context))
+
+(define-public (draw-lottery-winner (round-id uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (let ((round-data (unwrap! (map-get? lottery-rounds round-id) err-not-found)))
+            (asserts! (get is-active round-data) err-lottery-closed)
+            (asserts! (> (get-current-time) (get end-block round-data)) err-lottery-active)
+            (asserts! (> (get total-tickets round-data) u0) err-no-winner)
+            (let ((draw-block (get-current-time)))
+                (map-set lottery-rounds round-id {
+                    is-active: (get is-active round-data),
+                    prize-pool: (get prize-pool round-data),
+                    ticket-price: (get ticket-price round-data),
+                    end-block: (get end-block round-data),
+                    total-tickets: (get total-tickets round-data),
+                    winner: (get winner round-data),
+                    draw-block: draw-block
+                })
+                (ok draw-block)))))
+
+(define-public (finalize-lottery-winner (round-id uint))
+    (let ((caller tx-sender))
+        (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
+        (let ((round-data (unwrap! (map-get? lottery-rounds round-id) err-not-found)))
+            (asserts! (get is-active round-data) err-lottery-closed)
+            (asserts! (> (get draw-block round-data) u0) err-no-winner)
+            (asserts! (is-none (get winner round-data)) err-already-exists)
+            (let ((winning-ticket-id (generate-random-winner round-id (get total-tickets round-data))))
+                (let ((winner-principal (unwrap! (map-get? lottery-tickets {round-id: round-id, ticket-id: winning-ticket-id}) err-no-winner)))
+                    (let ((prize-amount (get prize-pool round-data)))
+                        (let ((winner-data (unwrap! (map-get? players winner-principal) err-not-found)))
+                            (map-set players winner-principal {
+                                points: (+ (get points winner-data) prize-amount),
+                                total-earned: (+ (get total-earned winner-data) prize-amount),
+                                tasks-completed: (get tasks-completed winner-data),
+                                last-daily-claim: (get last-daily-claim winner-data),
+                                registration-block: (get registration-block winner-data),
+                                is-active: (get is-active winner-data)
+                            })
+                            (map-set lottery-rounds round-id {
+                                is-active: false,
+                                prize-pool: (get prize-pool round-data),
+                                ticket-price: (get ticket-price round-data),
+                                end-block: (get end-block round-data),
+                                total-tickets: (get total-tickets round-data),
+                                winner: (some winner-principal),
+                                draw-block: (get draw-block round-data)
+                            })
+                            (ok winner-principal))))))))
+
 (define-public (award-achievement (player principal) (achievement-id uint))
     (let ((caller tx-sender))
         (asserts! (or (is-owner caller) (is-admin caller)) err-owner-only)
@@ -664,6 +805,16 @@
                 none)
         none))
 
+(define-read-only (get-lottery-round (round-id uint))
+    (map-get? lottery-rounds round-id))
+
+(define-read-only (get-player-lottery-tickets (player principal) (round-id uint))
+    (default-to u0 (map-get? player-lottery-tickets {player: player, round-id: round-id})))
+
+(define-read-only (get-current-lottery)
+    (let ((current-round (var-get current-lottery-round)))
+        (map-get? lottery-rounds current-round)))
+
 (define-read-only (get-game-stats)
     {
         total-players: (var-get total-players),
@@ -675,7 +826,8 @@
         referral-rate: (var-get referral-rate),
         total-referrals: (var-get total-referrals),
         total-staked: (var-get total-staked),
-        total-stakes: (var-get total-stakes)
+        total-stakes: (var-get total-stakes),
+        current-lottery-round: (var-get current-lottery-round)
     })
 
 (define-read-only (is-player-registered (player principal))
