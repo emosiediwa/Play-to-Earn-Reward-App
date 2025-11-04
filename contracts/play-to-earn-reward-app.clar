@@ -32,6 +32,11 @@
 (define-data-var current-lottery-round uint u0)
 (define-data-var lottery-ticket-price uint u50)
 
+(define-data-var redemption-active bool false)
+(define-data-var redemption-rate uint u1)
+(define-data-var total-redemptions uint u0)
+(define-data-var total-redemption-stx uint u0)
+
 (define-map players principal {
     points: uint,
     total-earned: uint,
@@ -390,6 +395,55 @@
                 })
                 (update-leaderboard recipient)
                 (ok amount)))))
+
+
+(define-public (set-redemption-rate (new-rate uint))
+    (let ((caller tx-sender))
+        (asserts! (is-owner caller) err-owner-only)
+        (asserts! (> new-rate u0) err-invalid-amount)
+        (var-set redemption-rate new-rate)
+        (ok new-rate)))
+
+(define-public (toggle-redemption)
+    (let ((caller tx-sender))
+        (asserts! (is-owner caller) err-owner-only)
+        (let ((active (var-get redemption-active)))
+            (var-set redemption-active (not active))
+            (ok (not active)))))
+
+(define-public (redeem (points uint))
+    (let ((caller tx-sender))
+        (asserts! (is-game-active) err-game-paused)
+        (asserts! (> points u0) err-invalid-amount)
+        (asserts! (var-get redemption-active) err-invalid-amount)
+        (let ((player-data (unwrap! (map-get? players caller) err-not-found)))
+            (asserts! (>= (get points player-data) points) err-insufficient-balance)
+            (let ((rate (var-get redemption-rate)))
+                (let ((amount (* points rate)))
+                    (match (as-contract (stx-transfer? amount tx-sender caller))
+                        transfer-ok
+                            (begin
+                                (map-set players caller {
+                                    points: (- (get points player-data) points),
+                                    total-earned: (get total-earned player-data),
+                                    tasks-completed: (get tasks-completed player-data),
+                                    last-daily-claim: (get last-daily-claim player-data),
+                                    registration-block: (get registration-block player-data),
+                                    is-active: (get is-active player-data)
+                                })
+                                (var-set total-redemptions (+ (var-get total-redemptions) u1))
+                                (var-set total-redemption-stx (+ (var-get total-redemption-stx) amount))
+                                (ok amount))
+                        err-code
+                            (err err-code)))))))
+
+(define-read-only (get-redemption-config)
+    {
+        active: (var-get redemption-active),
+        rate: (var-get redemption-rate),
+        total-redemptions: (var-get total-redemptions),
+        total-redemption-stx: (var-get total-redemption-stx)
+    })
 
 (define-public (create-task (task-id uint) (name (string-ascii 50)) (reward-points uint) (completion-limit uint))
     (let ((caller tx-sender))
